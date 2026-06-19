@@ -18,6 +18,9 @@ def test_model_runner_matches_transformers():
     checkpoint_path = Path(checkpoint)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    sys.path.insert(0, str(checkpoint_path / "code"))
+    importlib.import_module("deepseek_v4")
+
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
     input_ids = tokenizer("Hello", return_tensors="pt").input_ids.to(device)
 
@@ -27,8 +30,6 @@ def test_model_runner_matches_transformers():
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    sys.path.insert(0, str(checkpoint_path / "code"))
-    importlib.import_module("deepseek_v4")
     reference_model = AutoModelForCausalLM.from_pretrained(
         checkpoint_path,
         torch_dtype=torch.float32,
