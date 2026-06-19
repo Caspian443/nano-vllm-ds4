@@ -1,0 +1,18 @@
+# 模型权重(别提交进 git,体积大)
+*.safetensors
+*.gguf
+*.bin
+deepseek-v4-mini-1B-from-flash/
+hf_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 临时
+*.log
+.DS_Store
