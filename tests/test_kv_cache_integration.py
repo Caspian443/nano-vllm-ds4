@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from nanovllm_ds4.engine import create_cache_manager, create_model
+from nanovllm_ds4.engine import Scheduler, create_model
 
 
 def test_two_long_requests_can_decode_interleaved():
@@ -25,39 +25,16 @@ def test_two_long_requests_can_decode_interleaved():
         ).unsqueeze(0),
     ]
     max_new_tokens = 2
-    cache_manager = create_cache_manager(
+    scheduler = Scheduler(
         model,
         max_requests=2,
         max_seq_len=193,
     )
-    request_indices = [
-        cache_manager.allocate_request(),
-        cache_manager.allocate_request(),
-    ]
-    cached_ids = [prompt.clone() for prompt in prompts]
-    logits = []
+    for prompt in prompts:
+        scheduler.add_request(prompt, max_new_tokens)
 
     with torch.inference_mode():
-        for request_index, prompt in zip(request_indices, prompts):
-            cache_manager.allocate_tokens(request_index, prompt.shape[1])
-            logits.append(
-                model.forward_inference(prompt, cache_manager, request_index)
-            )
-
-        for step in range(max_new_tokens):
-            for index, request_index in enumerate(request_indices):
-                next_token = logits[index][:, -1, :].argmax(dim=-1)
-                cached_ids[index] = torch.cat(
-                    [cached_ids[index], next_token[:, None]],
-                    dim=-1,
-                )
-                if step + 1 < max_new_tokens:
-                    cache_manager.allocate_tokens(request_index, 1)
-                    logits[index] = model.forward_inference(
-                        next_token[:, None],
-                        cache_manager,
-                        request_index,
-                    )
+        cached_ids = scheduler.run()
 
         reference_ids = []
         for prompt in prompts:
@@ -73,13 +50,10 @@ def test_two_long_requests_can_decode_interleaved():
     for cached, reference in zip(cached_ids, reference_ids):
         assert torch.equal(cached, reference)
 
-    long_request = request_indices[1]
-    assert cache_manager.request_pool.request_lengths[long_request] == 192
-    second_c96_full_slot = cache_manager.request_pool.req_to_token[
-        long_request,
-        191,
-    ]
-    second_c96_slot = second_c96_full_slot // 96
+    cache_manager = scheduler.cache_manager
+    assert cache_manager.request_pool.request_lengths == [-1, -1]
+    assert len(cache_manager.slot_allocator.free_pages) == 6
+    assert torch.count_nonzero(cache_manager.kv_pool.swa_cache).item() == 0
     assert torch.count_nonzero(
-        cache_manager.kv_pool.compressed_cache[3][second_c96_slot]
+        cache_manager.kv_pool.compressed_cache[3][3]
     ).item() > 0
