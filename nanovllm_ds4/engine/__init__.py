@@ -5,18 +5,18 @@ from nanovllm_ds4.engine.kv_cache import (
     RequestTokenPool,
 )
 from nanovllm_ds4.engine.model_runner import (
-    create_cache_manager,
     create_model,
     generate,
     generate_next_token,
 )
+from nanovllm_ds4.engine.scheduler import Scheduler
 
 __all__ = [
     "DeepseekV4KVPool",
     "KVCacheManager",
     "PagedSlotAllocator",
     "RequestTokenPool",
-    "create_cache_manager",
+    "Scheduler",
     "create_model",
     "generate",
     "generate_next_token",
