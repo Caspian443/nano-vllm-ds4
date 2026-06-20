@@ -222,28 +222,87 @@ class DeepseekV4KVPool:
 
 
 class KVCacheManager:
-    """Own the KV-cache lifecycle for one active generation batch.
+    """Connect request mappings, page allocation, and physical KV tensors."""
 
-    The tensors remain in each attention layer:
-      layer.attn.kv_cache: [batch, sliding_window + compressed_blocks, head_dim]
-      compressor state:    [batch, partial_block_tokens, projected_head_dim]
+    def __init__(
+        self,
+        config,
+        max_requests,
+        max_seq_len,
+        num_pages,
+        page_size=96,
+        dtype=torch.bfloat16,
+        device="cpu",
+    ):
+        self.request_pool = RequestTokenPool(
+            max_requests,
+            max_seq_len,
+            device=device,
+        )
+        self.slot_allocator = PagedSlotAllocator(num_pages, page_size)
+        self.kv_pool = DeepseekV4KVPool(
+            config,
+            max_requests,
+            num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+        )
 
-    ``compressed_blocks`` is derived from the layer's config ratio, so the
-    mini checkpoint naturally uses its C4 and C96 layouts.
-    """
+    def allocate_request(self):
+        return self.request_pool.allocate_request()
 
-    def __init__(self, model, max_batch_size, max_seq_len):
-        self.model = model
-        self.model.setup_caches(max_batch_size, max_seq_len)
+    def allocate_tokens(self, request_index, num_tokens):
+        if num_tokens < 0:
+            raise ValueError("num_tokens must be non-negative")
 
-    def reset(self):
-        self.model.reset_caches()
+        start = self.request_pool.request_lengths[request_index]
+        if start < 0:
+            raise RuntimeError("request slot is not allocated")
+        if start + num_tokens > self.request_pool.req_to_token.shape[1]:
+            raise RuntimeError("request exceeds max_seq_len")
 
-    def prefill(self, input_ids):
-        # input_ids: [batch_size, prompt_length]
-        self.reset()
-        return self.model.forward_inference(input_ids, start_pos=0)
+        page_size = self.slot_allocator.page_size
+        offset = start % page_size
+        current_page_space = page_size - offset if start > 0 and offset else 0
+        remaining = max(0, num_tokens - current_page_space)
+        pages_needed = (remaining + page_size - 1) // page_size
+        if pages_needed > len(self.slot_allocator.free_pages):
+            raise RuntimeError("no free KV-cache pages")
 
-    def decode(self, input_ids):
-        # input_ids: [batch_size, 1]
-        return self.model.forward_inference(input_ids)
+        full_slots = []
+        position = start
+        while len(full_slots) < num_tokens:
+            offset = position % page_size
+            if offset == 0:
+                page_id = self.slot_allocator.allocate_page()
+                first_slot = page_id * page_size
+            else:
+                previous_slot = self.request_pool.req_to_token[
+                    request_index,
+                    position - 1,
+                ].item()
+                first_slot = previous_slot + 1
+
+            count = min(num_tokens - len(full_slots), page_size - offset)
+            full_slots.extend(range(first_slot, first_slot + count))
+            position += count
+
+        full_slots = torch.tensor(
+            full_slots,
+            dtype=torch.long,
+            device=self.request_pool.req_to_token.device,
+        )
+        self.request_pool.append(request_index, full_slots)
+        return full_slots
+
+    def free_request(self, request_index):
+        full_slots = self.request_pool.free_request(request_index)
+        if full_slots.numel() > 0:
+            page_ids = torch.unique(
+                full_slots // self.slot_allocator.page_size
+            ).tolist()
+            for page_id in page_ids:
+                self.slot_allocator.free_page(page_id)
+        self.kv_pool.reset_request(request_index)
+        return full_slots

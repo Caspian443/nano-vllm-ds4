@@ -1,6 +1,5 @@
 import torch
 
-from nanovllm_ds4.engine.kv_cache import KVCacheManager
 from nanovllm_ds4.models import DeepseekV4Config, DeepseekV4ForCausalLM
 from nanovllm_ds4.weights import load_model
 
@@ -41,15 +40,15 @@ def generate(model, input_ids, max_new_tokens):
     if max_new_tokens == 0:
         return input_ids
 
-    cache = KVCacheManager(
-        model,
+    model.setup_caches(
         max_batch_size=input_ids.shape[0],
         max_seq_len=input_ids.shape[1] + max_new_tokens,
     )
 
     with torch.inference_mode():
         # Prefill reads the whole prompt and stores its KV states.
-        logits = cache.prefill(input_ids)
+        model.reset_caches()
+        logits = model.forward_inference(input_ids, start_pos=0)
 
         for step in range(max_new_tokens):
             # logits: [batch_size, current_input_length, vocab_size]
@@ -60,7 +59,7 @@ def generate(model, input_ids, max_new_tokens):
 
             if step + 1 < max_new_tokens:
                 # Decode reads only the newest token; previous KV states stay cached.
-                logits = cache.decode(next_token_ids[:, None])
+                logits = model.forward_inference(next_token_ids[:, None])
 
     # input_ids: [batch_size, sequence_length + max_new_tokens]
     return input_ids

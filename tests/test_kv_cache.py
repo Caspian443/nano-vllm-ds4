@@ -5,6 +5,7 @@ import torch
 
 from nanovllm_ds4.engine.kv_cache import (
     DeepseekV4KVPool,
+    KVCacheManager,
     PagedSlotAllocator,
     RequestTokenPool,
 )
@@ -119,3 +120,65 @@ def test_deepseek_v4_kv_pool_tensor_layout_and_writes(device):
     assert torch.count_nonzero(pool.indexer_kv_state[1][1]).item() == 0
     assert torch.isneginf(pool.indexer_score_state[1][1]).all().item()
     assert torch.equal(pool.compressed_cache[1][24], kv)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is not available",
+            ),
+        ),
+    ],
+)
+def test_kv_cache_manager_allocates_frees_and_reuses_pages(device):
+    config = SimpleNamespace(
+        compress_ratios=[0, 4, 96],
+        sliding_window=64,
+        head_dim=64,
+        index_head_dim=64,
+    )
+    manager = KVCacheManager(
+        config,
+        max_requests=2,
+        max_seq_len=256,
+        num_pages=3,
+        device=device,
+    )
+
+    first_request = manager.allocate_request()
+    first_slots = manager.allocate_tokens(first_request, 100)
+    assert torch.equal(first_slots, torch.arange(100, device=device))
+
+    second_request = manager.allocate_request()
+    second_slots = manager.allocate_tokens(second_request, 2)
+    assert torch.equal(second_slots, torch.tensor([192, 193], device=device))
+
+    continued_slots = manager.allocate_tokens(first_request, 2)
+    assert torch.equal(continued_slots, torch.tensor([100, 101], device=device))
+
+    with pytest.raises(RuntimeError, match="no free KV-cache pages"):
+        manager.allocate_tokens(first_request, 95)
+    assert manager.request_pool.request_lengths[first_request] == 102
+
+    manager.kv_pool.swa_cache[:, first_request].fill_(1)
+    released_slots = manager.free_request(first_request)
+
+    assert released_slots.numel() == 102
+    assert manager.request_pool.request_lengths[first_request] == -1
+    assert torch.count_nonzero(
+        manager.request_pool.req_to_token[first_request] + 1
+    ).item() == 0
+    assert torch.count_nonzero(
+        manager.kv_pool.swa_cache[:, first_request]
+    ).item() == 0
+
+    reused_request = manager.allocate_request()
+    reused_slots = manager.allocate_tokens(reused_request, 97)
+    assert reused_request == first_request
+    assert torch.equal(reused_slots[:96], torch.arange(96, 192, device=device))
+    assert reused_slots[-1].item() == 0
