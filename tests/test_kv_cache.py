@@ -1,7 +1,13 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from nanovllm_ds4.engine.kv_cache import PagedSlotAllocator, RequestTokenPool
+from nanovllm_ds4.engine.kv_cache import (
+    DeepseekV4KVPool,
+    PagedSlotAllocator,
+    RequestTokenPool,
+)
 
 
 def test_request_token_pool_allocates_maps_and_reuses_request_slots():
@@ -46,3 +52,70 @@ def test_paged_slot_allocator_allocates_and_reuses_pages():
     allocator.free_page(first_page)
 
     assert allocator.allocate_page() == first_page
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is not available",
+            ),
+        ),
+    ],
+)
+def test_deepseek_v4_kv_pool_tensor_layout_and_writes(device):
+    config = SimpleNamespace(
+        compress_ratios=[0, 4, 96],
+        sliding_window=64,
+        head_dim=64,
+        index_head_dim=64,
+    )
+    pool = DeepseekV4KVPool(
+        config,
+        max_requests=2,
+        num_pages=2,
+        device=device,
+    )
+
+    assert pool.swa_cache.shape == (3, 2, 64, 64)
+    assert pool.swa_cache.dtype == torch.bfloat16
+    assert pool.swa_cache.device.type == device
+
+    assert pool.compressed_cache[0] is None
+    assert pool.compressed_cache[1].shape == (48, 64)
+    assert pool.compressed_cache[2].shape == (2, 64)
+    assert pool.indexer_cache[1].shape == (48, 64)
+    assert pool.indexer_cache[2] is None
+
+    assert pool.kv_state[1].shape == (2, 8, 128)
+    assert pool.kv_state[2].shape == (2, 96, 64)
+    assert pool.kv_state[1].dtype == torch.float32
+    assert pool.score_state[1].dtype == torch.float32
+
+    kv = torch.arange(64, device=device).to(torch.bfloat16)
+    pool.write_swa(0, request_index=1, token_position=65, kv=kv)
+    pool.write_compressed(1, full_slot=99, kv=kv)
+    pool.write_compressed(2, full_slot=191, kv=kv)
+    pool.write_indexer(1, full_slot=99, key=kv)
+
+    assert torch.equal(pool.swa_cache[0, 1, 1], kv)
+    assert torch.equal(pool.compressed_cache[1][24], kv)
+    assert torch.equal(pool.compressed_cache[2][1], kv)
+    assert torch.equal(pool.indexer_cache[1][24], kv)
+
+    pool.kv_state[1][1].fill_(1)
+    pool.score_state[1][1].fill_(0)
+    pool.indexer_kv_state[1][1].fill_(1)
+    pool.indexer_score_state[1][1].fill_(0)
+    pool.reset_request(1)
+
+    assert torch.count_nonzero(pool.swa_cache[:, 1]).item() == 0
+    assert torch.count_nonzero(pool.kv_state[1][1]).item() == 0
+    assert torch.isneginf(pool.score_state[1][1]).all().item()
+    assert torch.count_nonzero(pool.indexer_kv_state[1][1]).item() == 0
+    assert torch.isneginf(pool.indexer_score_state[1][1]).all().item()
+    assert torch.equal(pool.compressed_cache[1][24], kv)

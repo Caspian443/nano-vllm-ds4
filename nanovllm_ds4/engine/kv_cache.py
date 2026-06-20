@@ -80,6 +80,147 @@ class PagedSlotAllocator:
         return range(start, start + self.page_size)
 
 
+class DeepseekV4KVPool:
+    """Store DeepSeek V4 sliding-window and compressed KV tensors."""
+
+    def __init__(
+        self,
+        config,
+        max_requests,
+        num_pages,
+        page_size=96,
+        dtype=torch.bfloat16,
+        device="cpu",
+    ):
+        self.compress_ratios = tuple(config.compress_ratios)
+        total_full_slots = num_pages * page_size
+
+        # swa_cache[layer, request, token_position % sliding_window] = kv
+        self.swa_cache = torch.zeros(
+            (
+                len(self.compress_ratios),
+                max_requests,
+                config.sliding_window,
+                config.head_dim,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+
+        self.compressed_cache = []
+        self.indexer_cache = []
+        self.kv_state = []
+        self.score_state = []
+        self.indexer_kv_state = []
+        self.indexer_score_state = []
+
+        for ratio in self.compress_ratios:
+            if ratio == 0:
+                self.compressed_cache.append(None)
+                self.indexer_cache.append(None)
+                self.kv_state.append(None)
+                self.score_state.append(None)
+                self.indexer_kv_state.append(None)
+                self.indexer_score_state.append(None)
+                continue
+
+            if page_size % ratio != 0:
+                raise ValueError("page size must be divisible by compression ratio")
+
+            num_compressed_slots = total_full_slots // ratio
+            self.compressed_cache.append(
+                torch.zeros(
+                    num_compressed_slots,
+                    config.head_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+
+            overlap = ratio < 16
+            coefficient = 2 if overlap else 1
+            state_shape = (
+                max_requests,
+                coefficient * ratio,
+                coefficient * config.head_dim,
+            )
+            self.kv_state.append(
+                torch.zeros(state_shape, dtype=torch.float32, device=device)
+            )
+            self.score_state.append(
+                torch.full(
+                    state_shape,
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+
+            if overlap:
+                self.indexer_cache.append(
+                    torch.zeros(
+                        num_compressed_slots,
+                        config.index_head_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
+                )
+                indexer_state_shape = (
+                    max_requests,
+                    2 * ratio,
+                    2 * config.index_head_dim,
+                )
+                self.indexer_kv_state.append(
+                    torch.zeros(
+                        indexer_state_shape,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                )
+                self.indexer_score_state.append(
+                    torch.full(
+                        indexer_state_shape,
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                )
+            else:
+                self.indexer_cache.append(None)
+                self.indexer_kv_state.append(None)
+                self.indexer_score_state.append(None)
+
+    def write_swa(self, layer_index, request_index, token_position, kv):
+        swa_slot = token_position % self.swa_cache.shape[2]
+        self.swa_cache[layer_index, request_index, swa_slot].copy_(kv)
+
+    def write_compressed(self, layer_index, full_slot, kv):
+        cache = self.compressed_cache[layer_index]
+        if cache is None:
+            raise RuntimeError("layer does not use compressed KV cache")
+        compressed_slot = full_slot // self.compress_ratios[layer_index]
+        cache[compressed_slot].copy_(kv)
+
+    def write_indexer(self, layer_index, full_slot, key):
+        cache = self.indexer_cache[layer_index]
+        if cache is None:
+            raise RuntimeError("layer does not use indexer cache")
+        compressed_slot = full_slot // self.compress_ratios[layer_index]
+        cache[compressed_slot].copy_(key)
+
+    def reset_request(self, request_index):
+        self.swa_cache[:, request_index].zero_()
+        for layer_index in range(len(self.compress_ratios)):
+            if self.kv_state[layer_index] is not None:
+                self.kv_state[layer_index][request_index].zero_()
+                self.score_state[layer_index][request_index].fill_(float("-inf"))
+            if self.indexer_kv_state[layer_index] is not None:
+                self.indexer_kv_state[layer_index][request_index].zero_()
+                self.indexer_score_state[layer_index][request_index].fill_(
+                    float("-inf")
+                )
+
+
 class KVCacheManager:
     """Own the KV-cache lifecycle for one active generation batch.
 

@@ -1,4 +1,5 @@
 from nanovllm_ds4.engine.kv_cache import (
+    DeepseekV4KVPool,
     KVCacheManager,
     PagedSlotAllocator,
     RequestTokenPool,
@@ -10,6 +11,7 @@ from nanovllm_ds4.engine.model_runner import (
 )
 
 __all__ = [
+    "DeepseekV4KVPool",
     "KVCacheManager",
     "PagedSlotAllocator",
     "RequestTokenPool",
