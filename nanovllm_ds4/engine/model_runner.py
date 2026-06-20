@@ -4,10 +4,17 @@ from nanovllm_ds4.models import DeepseekV4Config, DeepseekV4ForCausalLM
 from nanovllm_ds4.weights import load_model
 
 
-def create_model(path, device="cpu"):
+def create_model(path, device="cpu", dtype=torch.bfloat16):
     config = DeepseekV4Config.from_pretrained(path)
-    model = DeepseekV4ForCausalLM(config)
-    model.to(device)
+
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            model = DeepseekV4ForCausalLM(config)
+    finally:
+        torch.set_default_dtype(original_dtype)
+
     load_model(model, path)
     model.eval()
     return model
