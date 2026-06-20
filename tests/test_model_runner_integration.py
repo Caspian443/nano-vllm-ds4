@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 from nanovllm_ds4.engine import create_model, generate
 
@@ -14,17 +14,19 @@ def test_model_runner_matches_transformers():
     checkpoint = os.environ.get("DEEPSEEK_V4_CHECKPOINT")
     if checkpoint is None:
         pytest.skip("DEEPSEEK_V4_CHECKPOINT is not set")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the long-request integration test")
 
     checkpoint_path = Path(checkpoint)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
 
     sys.path.insert(0, str(checkpoint_path / "code"))
     importlib.import_module("deepseek_v4")
 
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-    input_ids = tokenizer("Hello", return_tensors="pt").input_ids.to(device)
-
     model = create_model(checkpoint_path, device=device)
+    input_ids = (
+        torch.arange(101, device=device) % (model.config.vocab_size - 2) + 2
+    ).unsqueeze(0)
     assert model.embed.weight.dtype == torch.bfloat16
     assert model.layers[2].ffn.gate.bias.dtype == torch.float32
     assert model.layers[0].ffn.gate.tid2eid.dtype == torch.int64
