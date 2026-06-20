@@ -25,6 +25,10 @@ def test_model_runner_matches_transformers():
     input_ids = tokenizer("Hello", return_tensors="pt").input_ids.to(device)
 
     model = create_model(checkpoint_path, device=device)
+    assert model.embed.weight.dtype == torch.bfloat16
+    assert model.layers[2].ffn.gate.bias.dtype == torch.float32
+    assert model.layers[0].ffn.gate.tid2eid.dtype == torch.int64
+
     output_ids = generate(model, input_ids, max_new_tokens=2).cpu()
     del model
     if device == "cuda":
@@ -32,7 +36,7 @@ def test_model_runner_matches_transformers():
 
     reference_model = AutoModelForCausalLM.from_pretrained(
         checkpoint_path,
-        torch_dtype=torch.float32,
+        dtype=torch.bfloat16,
     ).to(device)
     reference_model.eval()
 
