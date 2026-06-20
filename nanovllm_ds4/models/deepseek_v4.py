@@ -748,56 +748,24 @@ class DeepseekV4Attention(nn.Module):
                                             config.index_n_heads, config.index_head_dim,
                                             m=compress_ratio, overlap=True)
 
-        # Inference cache: unified buffer
-        #   positions [0, window)               -> circular SW K/V
-        #   positions [window, window + n_blk)  -> committed compressed entries
-        # Allocated by setup_caches(); also wires the compressor's kv_cache as
-        # an alias into the compressed slice of this buffer.
-        self.kv_cache: Optional[torch.Tensor] = None
-        self._max_compressed = 0
-
     def setup_caches(self, max_batch_size: int, max_seq_len: int,
                      rope_cos, rope_sin, rope_cos_c, rope_sin_c):
-        """Allocate the unified kv_cache and wire compressor caches.
-
-        ``max_seq_len`` is used to size the compressed portion (one block per
-        ``compress_ratio`` source tokens) and to bound the RoPE table.
-        """
-        ref = next(iter(self.parameters()))
-        device, dtype = ref.device, ref.dtype
-        win = self.window
-        if self.compress_ratio:
-            self._max_compressed = max_seq_len // self.compress_ratio
-        else:
-            self._max_compressed = 0
-        kv_size = win + self._max_compressed
-        self.kv_cache = torch.zeros(max_batch_size, kv_size, self.c,
-                                    device=device, dtype=dtype)
+        """Store RoPE tables; KV tensors are owned by KVCacheManager."""
         if self.mode in ("csa", "hca"):
-            self.compressor.setup_caches(max_batch_size)
-            # Alias compressor's kv_cache into our compressed slice
-            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.kv_cache = None
             self.compressor.rope_cos_compressed = rope_cos_c
             self.compressor.rope_sin_compressed = rope_sin_c
             self.compressor.rope_dim = self.rope_dim
         if self.mode == "csa":
-            self.indexer.setup_caches(max_batch_size, max_seq_len,
-                                      rope_cos, rope_sin, rope_cos_c, rope_sin_c)
-        # Cache RoPE tables for use during decode
+            self.indexer.kv_cache = None
+            self.indexer.compressor.kv_cache = None
+            self.indexer.compressor.rope_cos_compressed = rope_cos_c
+            self.indexer.compressor.rope_sin_compressed = rope_sin_c
+            self.indexer.compressor.rope_dim = 0
         self._rope_cos = rope_cos
         self._rope_sin = rope_sin
         self._rope_cos_c = rope_cos_c
         self._rope_sin_c = rope_sin_c
-
-    def reset_cache(self):
-        if self.kv_cache is not None:
-            self.kv_cache.zero_()
-        if self.mode in ("csa", "hca"):
-            if self.compressor.kv_state is not None:
-                self.compressor.kv_state.zero_()
-                self.compressor.score_state.fill_(float("-inf"))
-        if self.mode == "csa":
-            self.indexer.reset_cache()
 
     def _output_proj(self, attn_out: torch.Tensor) -> torch.Tensor:
         """attn_out: [B, S, H, c]. Returns [B, S, d].
@@ -944,91 +912,205 @@ class DeepseekV4Attention(nn.Module):
         out = self._apply_output_rope(out, rope_cos, rope_sin, positions)
         return self._output_proj(out)
 
-    # ----------------------------------------------------------------------
-    # Inference forward — uses the unified ``kv_cache`` + sparse_attn helper.
-    # Mirrors inference/model.py:Attention.forward(x, start_pos) closely.
-    # ----------------------------------------------------------------------
-    def forward_inference(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        assert self.kv_cache is not None, "Attention.setup_caches() not called"
+    def forward_inference(self, x: torch.Tensor, start_pos: int,
+                          layer_index: int, cache_manager,
+                          request_index: int, full_slots: torch.Tensor) -> torch.Tensor:
+        """Cache-aware forward using the engine-owned paged KV pool."""
+        assert hasattr(self, "_rope_cos"), "setup_caches() not called"
         Bsz, S, _ = x.shape
+        assert Bsz == 1, "paged inference currently supports one request per call"
         H, c, m = self.H, self.c, self.compress_ratio
         win = self.window
-        rope_dim = self.rope_dim
+        pool = cache_manager.kv_pool
 
-        # Positions tensor for RoPE on Q and SW K
-        positions = torch.arange(start_pos, start_pos + S,
-                                 device=x.device, dtype=torch.long).clamp(
-            max=self._rope_cos.size(0) - 1
+        positions = torch.arange(
+            start_pos,
+            start_pos + S,
+            device=x.device,
+            dtype=torch.long,
         )
 
-        # Q (with per-head rsqrt-norm, partial RoPE)
         cQ = self.q_norm(self.wq_a(x))
         q = self.wq_b(cQ).view(Bsz, S, H, c)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) +
-                            self.config.rms_norm_eps).to(q.dtype)
-        q = apply_partial_rope(q.transpose(1, 2), self._rope_cos, self._rope_sin,
-                               rope_dim, positions).transpose(1, 2)
+        q = q * torch.rsqrt(
+            q.float().square().mean(-1, keepdim=True) + self.config.rms_norm_eps
+        ).to(q.dtype)
+        q = apply_partial_rope(
+            q.transpose(1, 2),
+            self._rope_cos,
+            self._rope_sin,
+            self.rope_dim,
+            positions,
+        ).transpose(1, 2)
 
-        # SW KV for new tokens (with partial RoPE)
-        kv_sw = self.kv_norm(self.wkv(x))                              # [B, S, c]
-        kv_sw = apply_partial_rope(kv_sw, self._rope_cos, self._rope_sin,
-                                   rope_dim, positions)
+        kv_sw = self.kv_norm(self.wkv(x))
+        kv_sw = apply_partial_rope(
+            kv_sw,
+            self._rope_cos,
+            self._rope_sin,
+            self.rope_dim,
+            positions,
+        )
 
-        # Build topk_idxs (window slot indices, then compressed slot indices)
-        topk_w = get_window_topk_idxs(win, Bsz, S, start_pos).to(x.device)
+        # At most one full window is written, so circular indices are unique.
+        keep_from = max(0, S - win)
+        swa_slots = positions[keep_from:] % win
+        pool.swa_cache[layer_index, request_index, swa_slots] = kv_sw[
+            0, keep_from:
+        ].to(pool.swa_cache.dtype)
+
+        kv_comp_new = None
+        indexer_new = None
         if m:
-            offset = S if start_pos == 0 else win
+            self.compressor.kv_state = pool.kv_state[layer_index][
+                request_index:request_index + 1
+            ]
+            self.compressor.score_state = pool.score_state[layer_index][
+                request_index:request_index + 1
+            ]
+            kv_comp_new = self.compressor.forward_inference(x, start_pos)
+
             if self.mode == "csa":
-                topk_c = self.indexer.select_inference(
-                    x, cQ, start_pos, offset, self.config.index_topk
+                self.indexer.compressor.kv_state = pool.indexer_kv_state[
+                    layer_index
+                ][request_index:request_index + 1]
+                self.indexer.compressor.score_state = pool.indexer_score_state[
+                    layer_index
+                ][request_index:request_index + 1]
+                indexer_new = self.indexer.compressor.forward_inference(
+                    x,
+                    start_pos,
                 )
-            else:  # hca
-                topk_c = get_compress_topk_idxs(m, Bsz, S, start_pos, offset).to(x.device)
-            topk_idxs = torch.cat([topk_w, topk_c], dim=-1)
-        else:
-            topk_idxs = topk_w
+
+            if kv_comp_new is not None:
+                if start_pos == 0:
+                    block_slots = full_slots[m - 1::m]
+                else:
+                    block_slots = full_slots[-1:]
+                pool.write_compressed(layer_index, block_slots, kv_comp_new[0])
+                if indexer_new is not None:
+                    pool.write_indexer(layer_index, block_slots, indexer_new[0])
+
+        topk_w = get_window_topk_idxs(win, Bsz, S, start_pos).to(x.device)
 
         if start_pos == 0:
-            # ----- prefill ----------------------------------------------------
-            # Save SW into circular buffer (last `win` tokens)
-            if S <= win:
-                self.kv_cache[:Bsz, :S] = kv_sw.to(self.kv_cache.dtype)
-            else:
-                cutoff = S % win
-                last = kv_sw[:, -win:]
-                if cutoff > 0:
-                    self.kv_cache[:Bsz, cutoff:win] = last[:, :win - cutoff].to(self.kv_cache.dtype)
-                    self.kv_cache[:Bsz, :cutoff] = last[:, win - cutoff:].to(self.kv_cache.dtype)
-                else:
-                    self.kv_cache[:Bsz, :win] = last.to(self.kv_cache.dtype)
-            # Build unified prefill KV: [SW (S positions of fresh kv) | compressed]
+            kv_unified = kv_sw
             if m:
-                if self.mode == "csa":
-                    # Indexer's compressor was already updated by select_inference;
-                    # we still need the main attention compressor.
-                    kv_comp = self.compressor.forward_inference(x, 0)
+                if kv_comp_new is None:
+                    kv_comp = kv_sw.new_zeros(1, 0, c)
                 else:
-                    kv_comp = self.compressor.forward_inference(x, 0)
-                if kv_comp is not None:
-                    kv_unified = torch.cat([kv_sw, kv_comp.to(kv_sw.dtype)], dim=1)
-                else:
-                    kv_unified = kv_sw
-            else:
-                kv_unified = kv_sw
-            o = sparse_attn(q, kv_unified, self.attn_sink, topk_idxs,
-                            scale=1.0 / math.sqrt(c))
-        else:
-            # ----- decode (single token) --------------------------------------
-            # Overwrite circular SW slot
-            self.kv_cache[:Bsz, start_pos % win] = kv_sw.squeeze(1).to(self.kv_cache.dtype)
-            if m and self.mode in ("csa", "hca"):
-                # Compressor may commit a new block (writes via alias into self.kv_cache)
-                self.compressor.forward_inference(x, start_pos)
-            o = sparse_attn(q, self.kv_cache[:Bsz], self.attn_sink, topk_idxs,
-                            scale=1.0 / math.sqrt(c))
+                    kv_comp = kv_comp_new.to(kv_sw.dtype)
+                kv_unified = torch.cat([kv_sw, kv_comp], dim=1)
 
-        # Output RoPE by -position
-        o = self._apply_output_rope(o, self._rope_cos, self._rope_sin, positions)
+                if self.mode == "csa":
+                    if indexer_new is None:
+                        indexer_keys = torch.zeros(
+                            (1, 0, self.config.index_head_dim),
+                            dtype=x.dtype,
+                            device=x.device,
+                        )
+                    else:
+                        indexer_keys = indexer_new
+                    selected, valid = self.indexer.select(
+                        x,
+                        cQ,
+                        indexer_keys,
+                        positions,
+                        m,
+                        self.config.index_topk,
+                    )
+                    topk_c = torch.where(
+                        valid,
+                        selected + S,
+                        torch.full_like(selected, -1),
+                    )
+                else:
+                    block_end = torch.arange(
+                        kv_comp.size(1),
+                        device=x.device,
+                    ) * m + (m - 1)
+                    selected = torch.arange(
+                        kv_comp.size(1),
+                        device=x.device,
+                    ).expand(S, -1)
+                    valid = block_end.unsqueeze(0) < positions.unsqueeze(1)
+                    topk_c = torch.where(
+                        valid,
+                        selected + S,
+                        torch.full_like(selected, -1),
+                    ).unsqueeze(0)
+                topk_idxs = torch.cat([topk_w, topk_c], dim=-1)
+            else:
+                topk_idxs = topk_w
+        else:
+            kv_unified = pool.swa_cache[
+                layer_index,
+                request_index,
+            ].unsqueeze(0)
+            if m:
+                block_positions = torch.arange(
+                    m - 1,
+                    start_pos + 1,
+                    m,
+                    device=x.device,
+                )
+                block_full_slots = cache_manager.request_pool.req_to_token[
+                    request_index,
+                    block_positions,
+                ]
+                compressed_slots = block_full_slots // m
+                kv_comp = pool.compressed_cache[layer_index].index_select(
+                    0,
+                    compressed_slots,
+                ).unsqueeze(0)
+                kv_unified = torch.cat([kv_unified, kv_comp], dim=1)
+
+                if self.mode == "csa":
+                    indexer_keys = pool.indexer_cache[layer_index].index_select(
+                        0,
+                        compressed_slots,
+                    ).unsqueeze(0)
+                    selected, valid = self.indexer.select(
+                        x,
+                        cQ,
+                        indexer_keys,
+                        positions,
+                        m,
+                        self.config.index_topk,
+                    )
+                    topk_c = torch.where(
+                        valid,
+                        selected + win,
+                        torch.full_like(selected, -1),
+                    )
+                else:
+                    selected = torch.arange(
+                        block_positions.numel(),
+                        device=x.device,
+                    ).view(1, 1, -1)
+                    valid = block_positions.view(1, 1, -1) < start_pos
+                    topk_c = torch.where(
+                        valid,
+                        selected + win,
+                        torch.full_like(selected, -1),
+                    )
+                topk_idxs = torch.cat([topk_w, topk_c], dim=-1)
+            else:
+                topk_idxs = topk_w
+
+        o = sparse_attn(
+            q,
+            kv_unified,
+            self.attn_sink,
+            topk_idxs,
+            scale=1.0 / math.sqrt(c),
+        )
+        o = self._apply_output_rope(
+            o,
+            self._rope_cos,
+            self._rope_sin,
+            positions,
+        )
         return self._output_proj(o)
 
 
@@ -1223,18 +1305,23 @@ class DeepseekV4Layer(nn.Module):
         return X
 
     def forward_inference(self, X: torch.Tensor, mhc: MHC,
-                          token_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """Cache-aware forward for incremental decode. Same mHC + sub-block
-        structure as ``forward`` but the attention path uses
-        ``self.attn.forward_inference(sub_in, start_pos)`` which reads/writes
-        the layer's kv_cache + compressor state.
-        """
+                          token_ids: torch.Tensor, start_pos: int,
+                          cache_manager, request_index: int,
+                          full_slots: torch.Tensor) -> torch.Tensor:
+        """Cache-aware layer forward using the engine-owned KV pool."""
         residual = X
         pre, post, comb = mhc.gen_params(X, self.hc_attn_base, self.hc_attn_fn,
                                          self.hc_attn_scale)
         sub_in = MHC.hc_pre(X, pre)
         sub_in = self.attn_norm(sub_in)
-        attn_out = self.attn.forward_inference(sub_in, start_pos)
+        attn_out = self.attn.forward_inference(
+            sub_in,
+            start_pos,
+            self.layer_idx,
+            cache_manager,
+            request_index,
+            full_slots,
+        )
         X = MHC.hc_post(attn_out, residual, post, comb)
 
         residual = X
@@ -1478,10 +1565,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     # KV-cache inference path (mirrors inference/model.py:Transformer.forward)
     # ----------------------------------------------------------------------
     def setup_caches(self, max_batch_size: int, max_seq_len: int):
-        """Allocate per-layer kv_cache + compressor state buffers and
-        precompute RoPE tables sized for ``max_seq_len``. Call once before
-        any ``forward_inference`` calls; call ``reset_caches`` between
-        independent generation runs."""
+        """Precompute RoPE tables; KV tensors are owned by KVCacheManager."""
         ref = next(iter(self.parameters()))
         device, dtype = ref.device, ref.dtype
         rope_dim = self.config.qk_rope_head_dim
@@ -1495,38 +1579,45 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
         self._inf_rope_sin = rope_sin
         self._inf_rope_cos_c = rope_cos_c
         self._inf_rope_sin_c = rope_sin_c
-        self._inf_max_batch = max_batch_size
-        self._inf_max_seq = max_seq_len
-        self._inf_seen = 0
         for layer in self.layers:
             layer.attn.setup_caches(max_batch_size, max_seq_len,
                                      rope_cos, rope_sin, rope_cos_c, rope_sin_c)
 
     def reset_caches(self):
-        self._inf_seen = 0
-        for layer in self.layers:
-            layer.attn.reset_cache()
+        """Request cache state is reset through KVCacheManager.free_request."""
 
-    def forward_inference(self, input_ids: torch.Tensor,
-                          start_pos: Optional[int] = None) -> torch.Tensor:
-        """Cache-aware forward. ``start_pos`` defaults to the cumulative
-        ``seen`` count; pass an int to override (or for parallel workers).
-        Returns logits ``[B, S, V]``."""
+    def forward_inference(self, input_ids: torch.Tensor, cache_manager,
+                          request_index: int) -> torch.Tensor:
+        """Cache-aware forward for one request. Returns ``[1, S, V]`` logits."""
         assert hasattr(self, "_inf_rope_cos"), "setup_caches() not called"
-        if start_pos is None:
-            start_pos = self._inf_seen
         Bsz, S = input_ids.shape
+        assert Bsz == 1, "paged inference currently supports one request per call"
+        end_pos = cache_manager.request_pool.request_lengths[request_index]
+        start_pos = end_pos - S
+        if start_pos < 0:
+            raise RuntimeError("allocate request tokens before model inference")
+        full_slots = cache_manager.request_pool.req_to_token[
+            request_index,
+            start_pos:end_pos,
+        ]
         h = self.embed(input_ids)
         n_hc = self.config.hc_mult
         X = h.unsqueeze(-2).expand(-1, -1, n_hc, -1).contiguous()
         for layer in self.layers:
-            X = layer.forward_inference(X, self._mhc, input_ids, start_pos)
+            X = layer.forward_inference(
+                X,
+                self._mhc,
+                input_ids,
+                start_pos,
+                cache_manager,
+                request_index,
+                full_slots,
+            )
         head_pre = self._mhc.gen_head_pre(X, self.hc_head_fn, self.hc_head_base,
                                           self.hc_head_scale)
         h_out = MHC.hc_pre(X, head_pre)
         h_out = self.norm(h_out)
         logits = self.head(h_out)
-        self._inf_seen = start_pos + S
         return logits
 
     def _backbone(self, input_ids, attention_mask, position_ids):

@@ -107,8 +107,13 @@ class DeepseekV4KVPool:
             device=device,
         )
 
+        # Completed C4/C96 entries used directly by attention.
         self.compressed_cache = []
         self.indexer_cache = []
+
+        # Inflight entries have not collected enough tokens to be compressed.
+        # They share the active request lifetime with swa_cache, but stay in
+        # separate FP32 tensors because compression also needs score values.
         self.kv_state = []
         self.score_state = []
         self.indexer_kv_state = []
@@ -198,15 +203,27 @@ class DeepseekV4KVPool:
         cache = self.compressed_cache[layer_index]
         if cache is None:
             raise RuntimeError("layer does not use compressed KV cache")
-        compressed_slot = full_slot // self.compress_ratios[layer_index]
-        cache[compressed_slot].copy_(kv)
+        full_slots = torch.as_tensor(
+            full_slot,
+            dtype=torch.long,
+            device=cache.device,
+        ).reshape(-1)
+        compressed_slots = full_slots // self.compress_ratios[layer_index]
+        values = kv.reshape(-1, cache.shape[-1]).to(cache)
+        cache.index_copy_(0, compressed_slots, values)
 
     def write_indexer(self, layer_index, full_slot, key):
         cache = self.indexer_cache[layer_index]
         if cache is None:
             raise RuntimeError("layer does not use indexer cache")
-        compressed_slot = full_slot // self.compress_ratios[layer_index]
-        cache[compressed_slot].copy_(key)
+        full_slots = torch.as_tensor(
+            full_slot,
+            dtype=torch.long,
+            device=cache.device,
+        ).reshape(-1)
+        compressed_slots = full_slots // self.compress_ratios[layer_index]
+        values = key.reshape(-1, cache.shape[-1]).to(cache)
+        cache.index_copy_(0, compressed_slots, values)
 
     def reset_request(self, request_index):
         self.swa_cache[:, request_index].zero_()
