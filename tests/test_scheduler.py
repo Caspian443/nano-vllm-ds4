@@ -16,6 +16,7 @@ class FakeModel(torch.nn.Module):
             index_head_dim=2,
         )
         self.prefill_shapes = []
+        self.prefill_cache_slots = []
         self.decode_shapes = []
 
     def setup_caches(self, max_batch_size, max_seq_len):
@@ -28,6 +29,12 @@ class FakeModel(torch.nn.Module):
 
     def forward_inference(self, input_ids, cache_manager, request_index):
         self.prefill_shapes.append(tuple(input_ids.shape))
+        self.prefill_cache_slots.append(
+            (
+                request_index,
+                cache_manager.request_pool.req_to_token[request_index, 0].item(),
+            )
+        )
         return self._logits(input_ids)
 
     def forward_decode(self, input_ids, cache_manager, request_indices):
@@ -47,3 +54,21 @@ def test_scheduler_batches_decode_and_shrinks_the_batch():
     assert torch.equal(outputs[1], torch.tensor([[4, 5, 6]]))
     assert model.prefill_shapes == [(1, 2), (1, 1)]
     assert model.decode_shapes == [(2, 1), (1, 1)]
+
+
+def test_scheduler_admits_a_new_request_after_cache_is_freed():
+    model = FakeModel()
+    scheduler = Scheduler(model, max_requests=1, max_seq_len=3)
+    first = scheduler.add_request(torch.tensor([[1]]), max_new_tokens=2)
+
+    assert scheduler.step() == []
+    second = scheduler.add_request(torch.tensor([[5]]), max_new_tokens=1)
+
+    assert scheduler.step() == [first]
+    assert scheduler.pending_requests == [second]
+    assert scheduler.step() == [second]
+
+    assert torch.equal(first.output_ids, torch.tensor([[1, 2, 3]]))
+    assert torch.equal(second.output_ids, torch.tensor([[5, 6]]))
+    assert model.prefill_cache_slots == [(0, 0), (0, 0)]
+    assert not scheduler.has_requests

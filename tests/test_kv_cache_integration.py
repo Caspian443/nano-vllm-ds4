@@ -7,7 +7,7 @@ import torch
 from nanovllm_ds4.engine import Scheduler, create_model
 
 
-def test_two_long_requests_can_decode_in_batches():
+def test_long_request_can_join_a_running_decode_batch():
     checkpoint = os.environ.get("DEEPSEEK_V4_CHECKPOINT")
     if checkpoint is None:
         pytest.skip("DEEPSEEK_V4_CHECKPOINT is not set")
@@ -30,9 +30,6 @@ def test_two_long_requests_can_decode_in_batches():
         max_requests=2,
         max_seq_len=193,
     )
-    for prompt, token_count in zip(prompts, max_new_tokens):
-        scheduler.add_request(prompt, token_count)
-
     decode_batch_sizes = []
     forward_decode = model.forward_decode
 
@@ -43,6 +40,9 @@ def test_two_long_requests_can_decode_in_batches():
     model.forward_decode = record_decode_batch
 
     with torch.inference_mode():
+        scheduler.add_request(prompts[0], max_new_tokens[0])
+        scheduler.step()
+        scheduler.add_request(prompts[1], max_new_tokens[1])
         cached_ids = scheduler.run()
 
         reference_ids = []
@@ -58,7 +58,7 @@ def test_two_long_requests_can_decode_in_batches():
 
     for cached, reference in zip(cached_ids, reference_ids):
         assert torch.equal(cached, reference)
-    assert decode_batch_sizes == [2, 1]
+    assert decode_batch_sizes == [1, 2]
 
     cache_manager = scheduler.cache_manager
     assert cache_manager.request_pool.request_lengths == [-1, -1]
