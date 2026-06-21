@@ -17,3 +17,34 @@ safetensors loader，以及独立的单元测试和真实 checkpoint 集成测�
 - 层类型(compress_ratios): sliding=[0,1,23], CSA(ratio4)=[2,4,...,22], HCA(ratio96)=[3,5,...,21]。
 - hash_moe 层=[0,1](有 tid2eid),其余普通 router(有 bias)。
 - indexer 仅在 CSA 层,与 compress_ratios 完全吻合。
+
+## 真实文本验证与 Benchmark
+
+真实文本回归覆盖中英文问答、代码、长上下文、等长 batched prefill、变长
+packed prefill、chunked prefill、continuous batching 和 KV slot/page 复用。
+
+```bash
+DEEPSEEK_V4_CHECKPOINT=/models/deepseek-v4-mini-1B-from-flash \
+python -m pytest tests/test_text_generation_integration.py -v -s
+```
+
+性能基线：
+
+```bash
+DEEPSEEK_V4_CHECKPOINT=/models/deepseek-v4-mini-1B-from-flash \
+python -m benchmarks.benchmark_text_generation \
+  --max-new-tokens 16 \
+  --max-prefill-tokens 128 \
+  --json-output benchmark.json
+```
+
+- TTFT: 请求提交到第一个输出 token 的时间。
+- TPOT: 第一个 token 之后，每个输出 token 的平均时间。
+- ITL: 相邻输出 token 的实际时间间隔。
+- Output throughput: 整个场景每秒生成的 token 数。
+- Prefill/decode throughput: 使用 CUDA Event 统计的模型调用吞吐。
+- Peak GPU memory / KV pages: 峰值显存和最大同时占用的 KV page 数。
+
+Benchmark 会先 warmup，再测试等长 batch 和混合 continuous/chunked 场景，最后
+用完整 forward 校验前两个输出 token。当前结果代表 PyTorch reference backend，
+后续 CPU/GPU offload、Shadow Radix 和 SM120 kernel 使用同一脚本对比。
