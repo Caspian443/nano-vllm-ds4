@@ -7,7 +7,7 @@ import torch
 from nanovllm_ds4.engine import Scheduler, create_model
 
 
-def test_two_long_requests_can_decode_interleaved():
+def test_two_long_requests_can_decode_in_batches():
     checkpoint = os.environ.get("DEEPSEEK_V4_CHECKPOINT")
     if checkpoint is None:
         pytest.skip("DEEPSEEK_V4_CHECKPOINT is not set")
@@ -24,22 +24,31 @@ def test_two_long_requests_can_decode_interleaved():
             + 2
         ).unsqueeze(0),
     ]
-    max_new_tokens = 2
+    max_new_tokens = [3, 2]
     scheduler = Scheduler(
         model,
         max_requests=2,
         max_seq_len=193,
     )
-    for prompt in prompts:
-        scheduler.add_request(prompt, max_new_tokens)
+    for prompt, token_count in zip(prompts, max_new_tokens):
+        scheduler.add_request(prompt, token_count)
+
+    decode_batch_sizes = []
+    forward_decode = model.forward_decode
+
+    def record_decode_batch(input_ids, cache_manager, request_indices):
+        decode_batch_sizes.append(input_ids.shape[0])
+        return forward_decode(input_ids, cache_manager, request_indices)
+
+    model.forward_decode = record_decode_batch
 
     with torch.inference_mode():
         cached_ids = scheduler.run()
 
         reference_ids = []
-        for prompt in prompts:
+        for prompt, token_count in zip(prompts, max_new_tokens):
             output_ids = prompt.clone()
-            for _ in range(max_new_tokens):
+            for _ in range(token_count):
                 next_token = model(output_ids).logits[:, -1, :].argmax(dim=-1)
                 output_ids = torch.cat(
                     [output_ids, next_token[:, None]],
@@ -49,6 +58,7 @@ def test_two_long_requests_can_decode_interleaved():
 
     for cached, reference in zip(cached_ids, reference_ids):
         assert torch.equal(cached, reference)
+    assert decode_batch_sizes == [2, 1]
 
     cache_manager = scheduler.cache_manager
     assert cache_manager.request_pool.request_lengths == [-1, -1]
