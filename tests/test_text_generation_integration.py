@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 from nanovllm_ds4.engine import Scheduler, create_model
 
@@ -47,7 +47,7 @@ def test_real_text_exercises_all_scheduler_paths():
         pytest.skip("CUDA is required for the real-text integration test")
 
     checkpoint = Path(checkpoint)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint)
     model = create_model(checkpoint, device="cuda")
     prompts = [
         tokenize_prompt(tokenizer, text, "cuda")

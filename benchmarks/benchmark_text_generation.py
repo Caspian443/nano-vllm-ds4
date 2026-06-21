@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 from nanovllm_ds4.engine import Scheduler, create_model
 
@@ -362,7 +362,7 @@ def main():
 
     checkpoint = Path(args.checkpoint)
     device = torch.device(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint)
     model = create_model(checkpoint, device=device)
     inputs = [tokenize(tokenizer, prompt, device) for prompt in PROMPTS]
 
