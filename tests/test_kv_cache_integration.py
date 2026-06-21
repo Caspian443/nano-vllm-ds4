@@ -7,7 +7,7 @@ import torch
 from nanovllm_ds4.engine import Scheduler, create_model
 
 
-def test_long_request_can_join_a_running_decode_batch():
+def test_continuous_chunked_and_batched_prefill_match_full_forward():
     checkpoint = os.environ.get("DEEPSEEK_V4_CHECKPOINT")
     if checkpoint is None:
         pytest.skip("DEEPSEEK_V4_CHECKPOINT is not set")
@@ -24,11 +24,12 @@ def test_long_request_can_join_a_running_decode_batch():
             + 2
         ).unsqueeze(0),
     ]
-    max_new_tokens = [3, 2]
+    max_new_tokens = [4, 2]
     scheduler = Scheduler(
         model,
         max_requests=2,
         max_seq_len=193,
+        max_prefill_tokens=190,
     )
     decode_batch_sizes = []
     forward_decode = model.forward_decode
@@ -58,7 +59,7 @@ def test_long_request_can_join_a_running_decode_batch():
 
     for cached, reference in zip(cached_ids, reference_ids):
         assert torch.equal(cached, reference)
-    assert decode_batch_sizes == [1, 2]
+    assert decode_batch_sizes == [1, 1, 2]
 
     cache_manager = scheduler.cache_manager
     assert cache_manager.request_pool.request_lengths == [-1, -1]
@@ -67,3 +68,49 @@ def test_long_request_can_join_a_running_decode_batch():
     assert torch.count_nonzero(
         cache_manager.kv_pool.compressed_cache[3][3]
     ).item() > 0
+
+    equal_prompts = [
+        prompts[0],
+        (
+            (torch.arange(101, device="cuda") * 7 + 3)
+            % (vocab_size - 2)
+            + 2
+        ).unsqueeze(0),
+    ]
+    prefill_batch_sizes = []
+    forward_prefill = model.forward_prefill
+
+    def record_prefill_batch(input_ids, cache_manager, request_indices, full_slots):
+        prefill_batch_sizes.append(tuple(input_ids.shape))
+        return forward_prefill(
+            input_ids,
+            cache_manager,
+            request_indices,
+            full_slots,
+        )
+
+    model.forward_prefill = record_prefill_batch
+    equal_scheduler = Scheduler(
+        model,
+        max_requests=2,
+        max_seq_len=103,
+    )
+    for prompt in equal_prompts:
+        equal_scheduler.add_request(prompt, max_new_tokens=2)
+    with torch.inference_mode():
+        equal_cached_ids = equal_scheduler.run()
+
+        equal_reference_ids = []
+        for prompt in equal_prompts:
+            output_ids = prompt.clone()
+            for _ in range(2):
+                next_token = model(output_ids).logits[:, -1, :].argmax(dim=-1)
+                output_ids = torch.cat(
+                    [output_ids, next_token[:, None]],
+                    dim=-1,
+                )
+            equal_reference_ids.append(output_ids)
+
+    assert prefill_batch_sizes == [(2, 101)]
+    for cached, reference in zip(equal_cached_ids, equal_reference_ids):
+        assert torch.equal(cached, reference)
