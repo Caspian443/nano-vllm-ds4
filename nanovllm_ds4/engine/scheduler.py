@@ -15,11 +15,12 @@ class Request:
 
 
 class Scheduler:
-    """Prefill requests separately, then decode active requests as one batch."""
+    """Continuously admit pending requests and batch active decode tokens."""
 
     def __init__(self, model, max_requests, max_seq_len, page_size=96):
         self.model = model
-        self.requests = []
+        self.pending_requests = []
+        self.running_requests = []
 
         num_pages_per_request = (max_seq_len + page_size - 1) // page_size
         device = next(model.parameters()).device
@@ -42,24 +43,33 @@ class Scheduler:
             raise ValueError("input_ids must contain at least one token")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
-        if len(self.requests) >= self.cache_manager.request_pool.req_to_token.shape[0]:
-            raise RuntimeError("scheduler request capacity exceeded")
         if input_ids.shape[1] + max_new_tokens > (
             self.cache_manager.request_pool.req_to_token.shape[1]
         ):
             raise RuntimeError("request exceeds max_seq_len")
 
-        self.requests.append(Request(input_ids, max_new_tokens))
+        request = Request(input_ids, max_new_tokens)
+        self.pending_requests.append(request)
+        return request
 
-    def run(self):
-        requests = self.requests
-        self.requests = []
-        active = []
+    @property
+    def has_requests(self):
+        return bool(self.pending_requests or self.running_requests)
 
+    def step(self):
+        """Run one scheduling step and return requests finished in this step."""
+        finished_requests = []
         with torch.inference_mode():
-            for request in requests:
+            while self.pending_requests:
+                request = self.pending_requests[0]
                 if request.max_new_tokens == 0:
+                    self.pending_requests.pop(0)
+                    finished_requests.append(request)
                     continue
+                if not self.cache_manager.request_pool.free_request_slots:
+                    break
+
+                self.pending_requests.pop(0)
                 request.request_index = self.cache_manager.allocate_request()
                 self.cache_manager.allocate_tokens(
                     request.request_index,
@@ -70,43 +80,50 @@ class Scheduler:
                     self.cache_manager,
                     request.request_index,
                 )
-                active.append(request)
+                self.running_requests.append(request)
 
-            while active:
-                next_active = []
-                decode_tokens = []
-                for request in active:
-                    next_token = request.logits[:, -1, :].argmax(dim=-1)
-                    request.output_ids = torch.cat(
-                        [request.output_ids, next_token[:, None]],
-                        dim=-1,
-                    )
-                    request.generated_tokens += 1
+            next_running = []
+            decode_tokens = []
+            for request in self.running_requests:
+                next_token = request.logits[:, -1, :].argmax(dim=-1)
+                request.output_ids = torch.cat(
+                    [request.output_ids, next_token[:, None]],
+                    dim=-1,
+                )
+                request.generated_tokens += 1
 
-                    if request.generated_tokens < request.max_new_tokens:
-                        self.cache_manager.allocate_tokens(request.request_index, 1)
-                        next_active.append(request)
-                        decode_tokens.append(next_token[:, None])
-                    else:
-                        self.cache_manager.free_request(request.request_index)
-                        request.logits = None
+                if request.generated_tokens < request.max_new_tokens:
+                    self.cache_manager.allocate_tokens(request.request_index, 1)
+                    next_running.append(request)
+                    decode_tokens.append(next_token[:, None])
+                else:
+                    self.cache_manager.free_request(request.request_index)
+                    request.logits = None
+                    finished_requests.append(request)
 
-                if next_active:
-                    # input_ids: [B, 1], request_indices: [B]
-                    input_ids = torch.cat(decode_tokens, dim=0)
-                    request_indices = torch.tensor(
-                        [request.request_index for request in next_active],
-                        dtype=torch.long,
-                        device=input_ids.device,
-                    )
-                    logits = self.model.forward_decode(
-                        input_ids,
-                        self.cache_manager,
-                        request_indices,
-                    )
-                    for batch_index, request in enumerate(next_active):
-                        request.logits = logits[batch_index:batch_index + 1]
+            if next_running:
+                # input_ids: [B, 1], request_indices: [B]
+                input_ids = torch.cat(decode_tokens, dim=0)
+                request_indices = torch.tensor(
+                    [request.request_index for request in next_running],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                logits = self.model.forward_decode(
+                    input_ids,
+                    self.cache_manager,
+                    request_indices,
+                )
+                for batch_index, request in enumerate(next_running):
+                    request.logits = logits[batch_index:batch_index + 1]
 
-                active = next_active
+            self.running_requests = next_running
+
+        return finished_requests
+
+    def run(self):
+        requests = [*self.running_requests, *self.pending_requests]
+        while self.has_requests:
+            self.step()
 
         return [request.output_ids for request in requests]
