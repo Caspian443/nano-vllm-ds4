@@ -22,12 +22,15 @@ TEXT_PROMPTS = [
 
 
 def tokenize_prompt(tokenizer, text, device):
-    return tokenizer.apply_chat_template(
+    encoded = tokenizer.apply_chat_template(
         [{"role": "user", "content": text}],
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
-    ).to(device)
+    )
+    if not isinstance(encoded, torch.Tensor):
+        encoded = encoded["input_ids"]
+    return encoded.to(device)
 
 
 @torch.inference_mode()
