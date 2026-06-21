@@ -9,12 +9,13 @@ from nanovllm_ds4.engine.model_runner import (
     generate,
     generate_next_token,
 )
-from nanovllm_ds4.engine.scheduler import Scheduler
+from nanovllm_ds4.engine.scheduler import PrefillBatch, Scheduler
 
 __all__ = [
     "DeepseekV4KVPool",
     "KVCacheManager",
     "PagedSlotAllocator",
+    "PrefillBatch",
     "RequestTokenPool",
     "Scheduler",
     "create_model",
