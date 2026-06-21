@@ -1005,14 +1005,25 @@ class DeepseekV4Attention(nn.Module):
 
     def forward_inference(self, x: torch.Tensor, start_pos: int,
                           layer_index: int, cache_manager,
-                          request_index: int, full_slots: torch.Tensor) -> torch.Tensor:
+                          request_indices, full_slots: torch.Tensor) -> torch.Tensor:
         """Cache-aware forward using the engine-owned paged KV pool."""
         assert hasattr(self, "_rope_cos"), "setup_caches() not called"
         Bsz, S, _ = x.shape
-        assert Bsz == 1, "paged inference currently supports one request per call"
         H, c, m = self.H, self.c, self.compress_ratio
         win = self.window
         pool = cache_manager.kv_pool
+        request_indices = torch.as_tensor(
+            request_indices,
+            dtype=torch.long,
+            device=x.device,
+        ).reshape(-1)
+        assert request_indices.numel() == Bsz
+        if full_slots.ndim == 1:
+            full_slots = full_slots.unsqueeze(0)
+        assert full_slots.shape == (Bsz, S)
+        if start_pos > 0:
+            assert Bsz == 1
+            request_index = request_indices[0].item()
 
         positions = torch.arange(
             start_pos,
@@ -1046,41 +1057,58 @@ class DeepseekV4Attention(nn.Module):
         # At most one full window is written, so circular indices are unique.
         keep_from = max(0, S - win)
         swa_slots = positions[keep_from:] % win
-        pool.swa_cache[layer_index, request_index, swa_slots] = kv_sw[
-            0, keep_from:
-        ].to(pool.swa_cache.dtype)
+        pool.swa_cache[layer_index][
+            request_indices.unsqueeze(1),
+            swa_slots.unsqueeze(0),
+        ] = kv_sw[:, keep_from:].to(pool.swa_cache.dtype)
 
         kv_comp_new = None
         indexer_new = None
         if m:
-            self.compressor.kv_state = pool.kv_state[layer_index][
-                request_index:request_index + 1
-            ]
-            self.compressor.score_state = pool.score_state[layer_index][
-                request_index:request_index + 1
-            ]
+            kv_state = pool.kv_state[layer_index].index_select(
+                0, request_indices
+            )
+            score_state = pool.score_state[layer_index].index_select(
+                0, request_indices
+            )
+            self.compressor.kv_state = kv_state
+            self.compressor.score_state = score_state
             kv_comp_new = self.compressor.forward_inference(x, start_pos)
+            pool.kv_state[layer_index].index_copy_(
+                0, request_indices, kv_state
+            )
+            pool.score_state[layer_index].index_copy_(
+                0, request_indices, score_state
+            )
 
             if self.mode == "csa":
-                self.indexer.compressor.kv_state = pool.indexer_kv_state[
+                indexer_kv_state = pool.indexer_kv_state[
                     layer_index
-                ][request_index:request_index + 1]
-                self.indexer.compressor.score_state = pool.indexer_score_state[
+                ].index_select(0, request_indices)
+                indexer_score_state = pool.indexer_score_state[
                     layer_index
-                ][request_index:request_index + 1]
+                ].index_select(0, request_indices)
+                self.indexer.compressor.kv_state = indexer_kv_state
+                self.indexer.compressor.score_state = indexer_score_state
                 indexer_new = self.indexer.compressor.forward_inference(
                     x,
                     start_pos,
                 )
+                pool.indexer_kv_state[layer_index].index_copy_(
+                    0, request_indices, indexer_kv_state
+                )
+                pool.indexer_score_state[layer_index].index_copy_(
+                    0, request_indices, indexer_score_state
+                )
 
             if kv_comp_new is not None:
                 if start_pos == 0:
-                    block_slots = full_slots[m - 1::m]
+                    block_slots = full_slots[:, m - 1::m]
                 else:
-                    block_slots = full_slots[-1:]
-                pool.write_compressed(layer_index, block_slots, kv_comp_new[0])
+                    block_slots = full_slots[:, -1:]
+                pool.write_compressed(layer_index, block_slots, kv_comp_new)
                 if indexer_new is not None:
-                    pool.write_indexer(layer_index, block_slots, indexer_new[0])
+                    pool.write_indexer(layer_index, block_slots, indexer_new)
 
         topk_w = get_window_topk_idxs(win, Bsz, S, start_pos).to(x.device)
 
@@ -1088,7 +1116,7 @@ class DeepseekV4Attention(nn.Module):
             kv_unified = kv_sw
             if m:
                 if kv_comp_new is None:
-                    kv_comp = kv_sw.new_zeros(1, 0, c)
+                    kv_comp = kv_sw.new_zeros(Bsz, 0, c)
                 else:
                     kv_comp = kv_comp_new.to(kv_sw.dtype)
                 kv_unified = torch.cat([kv_sw, kv_comp], dim=1)
@@ -1096,7 +1124,7 @@ class DeepseekV4Attention(nn.Module):
                 if self.mode == "csa":
                     if indexer_new is None:
                         indexer_keys = torch.zeros(
-                            (1, 0, self.config.index_head_dim),
+                            (Bsz, 0, self.config.index_head_dim),
                             dtype=x.dtype,
                             device=x.device,
                         )
@@ -1129,7 +1157,7 @@ class DeepseekV4Attention(nn.Module):
                         valid,
                         selected + S,
                         torch.full_like(selected, -1),
-                    ).unsqueeze(0)
+                    ).unsqueeze(0).expand(Bsz, -1, -1)
                 topk_idxs = torch.cat([topk_w, topk_c], dim=-1)
             else:
                 topk_idxs = topk_w
@@ -1576,7 +1604,7 @@ class DeepseekV4Layer(nn.Module):
 
     def forward_inference(self, X: torch.Tensor, mhc: MHC,
                           token_ids: torch.Tensor, start_pos: int,
-                          cache_manager, request_index: int,
+                          cache_manager, request_indices,
                           full_slots: torch.Tensor) -> torch.Tensor:
         """Cache-aware layer forward using the engine-owned KV pool."""
         residual = X
@@ -1589,7 +1617,7 @@ class DeepseekV4Layer(nn.Module):
             start_pos,
             self.layer_idx,
             cache_manager,
-            request_index,
+            request_indices,
             full_slots,
         )
         X = MHC.hc_post(attn_out, residual, post, comb)
@@ -1887,9 +1915,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     def forward_inference(self, input_ids: torch.Tensor, cache_manager,
                           request_index: int) -> torch.Tensor:
         """Cache-aware forward for one request. Returns ``[1, S, V]`` logits."""
-        assert hasattr(self, "_inf_rope_cos"), "setup_caches() not called"
-        Bsz, S = input_ids.shape
-        assert Bsz == 1, "paged inference currently supports one request per call"
+        _, S = input_ids.shape
         end_pos = cache_manager.request_pool.request_lengths[request_index]
         start_pos = end_pos - S
         if start_pos < 0:
@@ -1898,6 +1924,37 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
             request_index,
             start_pos:end_pos,
         ]
+        if start_pos == 0:
+            return self.forward_prefill(
+                input_ids,
+                cache_manager,
+                torch.tensor([request_index], device=input_ids.device),
+                full_slots.unsqueeze(0),
+            )
+        if S == 1:
+            return self.forward_decode_positions(
+                input_ids,
+                cache_manager,
+                torch.tensor([request_index], device=input_ids.device),
+                torch.tensor([start_pos], device=input_ids.device),
+                full_slots,
+            )
+        raise RuntimeError("chunked prefill must use forward_packed_prefill")
+
+    def forward_prefill(self, input_ids: torch.Tensor, cache_manager,
+                        request_indices: torch.Tensor,
+                        full_slots: torch.Tensor) -> torch.Tensor:
+        """Prefill equal-length requests with ``input_ids [B, S]``."""
+        assert hasattr(self, "_inf_rope_cos"), "setup_caches() not called"
+        Bsz, S = input_ids.shape
+        request_indices = torch.as_tensor(
+            request_indices,
+            dtype=torch.long,
+            device=input_ids.device,
+        ).reshape(-1)
+        assert request_indices.numel() == Bsz
+        assert full_slots.shape == (Bsz, S)
+
         h = self.embed(input_ids)
         n_hc = self.config.hc_mult
         X = h.unsqueeze(-2).expand(-1, -1, n_hc, -1).contiguous()
@@ -1906,9 +1963,9 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
                 X,
                 self._mhc,
                 input_ids,
-                start_pos,
+                0,
                 cache_manager,
-                request_index,
+                request_indices,
                 full_slots,
             )
         head_pre = self._mhc.gen_head_pre(X, self.hc_head_fn, self.hc_head_base,
@@ -1921,7 +1978,6 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     def forward_decode(self, input_ids: torch.Tensor, cache_manager,
                        request_indices: torch.Tensor) -> torch.Tensor:
         """Decode ``input_ids [B, 1]`` for B independently cached requests."""
-        assert hasattr(self, "_inf_rope_cos"), "setup_caches() not called"
         Bsz, S = input_ids.shape
         assert S == 1, "batched decode expects input_ids shaped [B, 1]"
         request_indices = torch.as_tensor(
@@ -1945,7 +2001,20 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
             request_indices,
             positions,
         ]
+        return self.forward_decode_positions(
+            input_ids,
+            cache_manager,
+            request_indices,
+            positions,
+            full_slots,
+        )
 
+    def forward_decode_positions(self, input_ids: torch.Tensor, cache_manager,
+                                 request_indices: torch.Tensor,
+                                 positions: torch.Tensor,
+                                 full_slots: torch.Tensor) -> torch.Tensor:
+        """Decode one token at explicitly supplied positions and cache slots."""
+        assert hasattr(self, "_inf_rope_cos"), "setup_caches() not called"
         h = self.embed(input_ids)
         n_hc = self.config.hc_mult
         X = h.unsqueeze(-2).expand(-1, -1, n_hc, -1).contiguous()
@@ -1963,6 +2032,78 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
                                           self.hc_head_scale)
         h_out = MHC.hc_pre(X, head_pre)
         return self.head(self.norm(h_out))
+
+    def forward_packed_prefill(self, batch, cache_manager) -> torch.Tensor:
+        """Reference packed backend; SM120 kernels can consume the same metadata."""
+        seq_lens = batch.seq_lens.tolist()
+        offsets = batch.offsets.tolist()
+        start_positions = batch.start_positions.tolist()
+        batch_size = len(seq_lens)
+        last_logits = [None] * batch_size
+
+        equal_length_groups = {}
+        for batch_index, (seq_len, start_pos) in enumerate(
+            zip(seq_lens, start_positions)
+        ):
+            if start_pos == 0:
+                equal_length_groups.setdefault(seq_len, []).append(batch_index)
+
+        for seq_len, batch_indices in equal_length_groups.items():
+            input_ids = torch.stack(
+                [
+                    batch.packed_tokens[offsets[index]:offsets[index + 1]]
+                    for index in batch_indices
+                ]
+            )
+            full_slots = torch.stack(
+                [
+                    batch.full_slots[offsets[index]:offsets[index + 1]]
+                    for index in batch_indices
+                ]
+            )
+            request_indices = batch.request_indices[batch_indices]
+            logits = self.forward_prefill(
+                input_ids,
+                cache_manager,
+                request_indices,
+                full_slots,
+            )
+            for group_index, batch_index in enumerate(batch_indices):
+                last_logits[batch_index] = logits[group_index, -1]
+
+        continuation_indices = [
+            index
+            for index, start_pos in enumerate(start_positions)
+            if start_pos > 0
+        ]
+        max_continuation = max(
+            (seq_lens[index] for index in continuation_indices),
+            default=0,
+        )
+        for token_offset in range(max_continuation):
+            active = [
+                index
+                for index in continuation_indices
+                if token_offset < seq_lens[index]
+            ]
+            packed_indices = torch.tensor(
+                [offsets[index] + token_offset for index in active],
+                dtype=torch.long,
+                device=batch.packed_tokens.device,
+            )
+            input_ids = batch.packed_tokens[packed_indices].unsqueeze(1)
+            positions = batch.start_positions[active] + token_offset
+            logits = self.forward_decode_positions(
+                input_ids,
+                cache_manager,
+                batch.request_indices[active],
+                positions,
+                batch.full_slots[packed_indices],
+            )
+            for active_index, batch_index in enumerate(active):
+                last_logits[batch_index] = logits[active_index, -1]
+
+        return torch.stack(last_logits).unsqueeze(1)
 
     def _backbone(self, input_ids, attention_mask, position_ids):
         """Runs embed -> hc-expand -> N layers and returns BOTH the post-layer
