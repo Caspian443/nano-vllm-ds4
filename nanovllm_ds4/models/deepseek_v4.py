@@ -94,6 +94,20 @@ def apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     return torch.cat([x_pass, x_rot], dim=-1)
 
 
+def apply_partial_rope_decode(x: torch.Tensor, cos: torch.Tensor,
+                              sin: torch.Tensor, rope_dim: int,
+                              positions: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to one decode token at a different position per request."""
+    if rope_dim <= 0:
+        return x
+    x_pass, x_rot = x[..., :-rope_dim], x[..., -rope_dim:]
+    shape = (positions.numel(),) + (1,) * (x.dim() - 2) + (rope_dim,)
+    c = cos[positions].view(shape)
+    s = sin[positions].view(shape)
+    x_rot = (x_rot * c) + (_rotate_half(x_rot) * s)
+    return torch.cat([x_pass, x_rot], dim=-1)
+
+
 # =============================================================================
 # Manifold-Constrained Hyper-Connections (mHC)
 # =============================================================================
@@ -540,6 +554,55 @@ class Compressor(nn.Module):
             self.kv_cache[:Bsz, start_pos // m] = committed.squeeze(1).to(self.kv_cache.dtype)
         return committed
 
+    def forward_decode(self, h: torch.Tensor, positions: torch.Tensor,
+                       kv_state: torch.Tensor, score_state: torch.Tensor):
+        """Update one inflight compression token for each request in the batch."""
+        Bsz, S, _ = h.shape
+        assert S == 1, f"decode step expects S=1, got {S}"
+        m, d = self.m, self.head_dim
+        rows = torch.arange(Bsz, device=h.device)
+        state_slots = positions % m
+
+        xx = h.to(self.wkv.weight.dtype)
+        kv = self.wkv(xx).float().squeeze(1)
+        score = self.wgate(xx).float().squeeze(1) + self.ape.float()[state_slots]
+        should_commit = (positions + 1) % m == 0
+
+        if self.overlap:
+            kv_state[rows, m + state_slots] = kv
+            score_state[rows, m + state_slots] = score
+            current_kv = torch.cat(
+                [kv_state[:, :m, :d], kv_state[:, m:, d:]],
+                dim=1,
+            )
+            current_score = torch.cat(
+                [score_state[:, :m, :d], score_state[:, m:, d:]],
+                dim=1,
+            )
+            committed = (
+                current_kv * current_score.softmax(dim=1)
+            ).sum(dim=1, keepdim=True)
+            commit_rows = rows[should_commit]
+            kv_state[commit_rows, :m] = kv_state[commit_rows, m:]
+            score_state[commit_rows, :m] = score_state[commit_rows, m:]
+        else:
+            kv_state[rows, state_slots] = kv
+            score_state[rows, state_slots] = score
+            committed = (
+                kv_state * score_state.softmax(dim=1)
+            ).sum(dim=1, keepdim=True)
+
+        committed = self.norm(committed.to(h.dtype))
+        if self.rope_dim > 0 and self.rope_cos_compressed is not None:
+            committed = apply_partial_rope_decode(
+                committed,
+                self.rope_cos_compressed,
+                self.rope_sin_compressed,
+                self.rope_dim,
+                positions,
+            )
+        return committed.squeeze(1), should_commit
+
 
 # =============================================================================
 # Lightning Indexer
@@ -658,6 +721,34 @@ class LightningIndexer(nn.Module):
         if k <= 0:
             empty = torch.zeros(Bsz, Lq, 0, dtype=torch.long, device=h.device)
             return empty, empty.bool()
+        topk = scores.topk(k, dim=-1)
+        return topk.indices, torch.isfinite(topk.values)
+
+    def select_decode(self, h: torch.Tensor, cQ: torch.Tensor, K: torch.Tensor,
+                      positions: torch.Tensor, block_valid: torch.Tensor,
+                      m: int, top_k: int):
+        """Select compressed blocks for batched one-token decode."""
+        Bsz = h.shape[0]
+        num_blocks = K.shape[1]
+        if num_blocks == 0:
+            empty = torch.zeros(Bsz, 1, 0, dtype=torch.long, device=h.device)
+            return empty, empty.bool()
+
+        qI = self.wq_b(cQ).view(Bsz, 1, self.n_heads, self.head_dim)
+        wI = self.weights_proj(h) * self.score_scale
+        scores = torch.einsum("blhd,bsd->blhs", qI, K)
+        scores = (wI.unsqueeze(-1) * F.relu(scores)).sum(dim=2)
+
+        block_end = (
+            torch.arange(num_blocks, device=h.device) * m + (m - 1)
+        )
+        causal = block_end.unsqueeze(0) < positions.unsqueeze(1)
+        scores = scores.masked_fill(
+            ~(causal & block_valid).unsqueeze(1),
+            float("-inf"),
+        )
+
+        k = min(top_k, num_blocks)
         topk = scores.topk(k, dim=-1)
         return topk.indices, torch.isfinite(topk.values)
 
@@ -1113,6 +1204,185 @@ class DeepseekV4Attention(nn.Module):
         )
         return self._output_proj(o)
 
+    def forward_decode(self, x: torch.Tensor, positions: torch.Tensor,
+                       layer_index: int, cache_manager,
+                       request_indices: torch.Tensor,
+                       full_slots: torch.Tensor) -> torch.Tensor:
+        """Decode one token for B requests using one batched attention call."""
+        Bsz, S, _ = x.shape
+        assert S == 1, f"decode step expects S=1, got {S}"
+        H, c, m = self.H, self.c, self.compress_ratio
+        win = self.window
+        pool = cache_manager.kv_pool
+
+        cQ = self.q_norm(self.wq_a(x))
+        q = self.wq_b(cQ).view(Bsz, 1, H, c)
+        q = q * torch.rsqrt(
+            q.float().square().mean(-1, keepdim=True) + self.config.rms_norm_eps
+        ).to(q.dtype)
+        q = apply_partial_rope_decode(
+            q,
+            self._rope_cos,
+            self._rope_sin,
+            self.rope_dim,
+            positions,
+        )
+
+        kv_sw = self.kv_norm(self.wkv(x))
+        kv_sw = apply_partial_rope_decode(
+            kv_sw,
+            self._rope_cos,
+            self._rope_sin,
+            self.rope_dim,
+            positions,
+        )
+        pool.swa_cache[
+            layer_index,
+            request_indices,
+            positions % win,
+        ] = kv_sw[:, 0].to(pool.swa_cache.dtype)
+
+        if m:
+            kv_state = pool.kv_state[layer_index].index_select(
+                0, request_indices
+            )
+            score_state = pool.score_state[layer_index].index_select(
+                0, request_indices
+            )
+            kv_comp_new, should_commit = self.compressor.forward_decode(
+                x,
+                positions,
+                kv_state,
+                score_state,
+            )
+            pool.kv_state[layer_index].index_copy_(
+                0, request_indices, kv_state
+            )
+            pool.score_state[layer_index].index_copy_(
+                0, request_indices, score_state
+            )
+            if should_commit.any():
+                pool.write_compressed(
+                    layer_index,
+                    full_slots[should_commit],
+                    kv_comp_new[should_commit],
+                )
+
+            if self.mode == "csa":
+                indexer_kv_state = pool.indexer_kv_state[
+                    layer_index
+                ].index_select(0, request_indices)
+                indexer_score_state = pool.indexer_score_state[
+                    layer_index
+                ].index_select(0, request_indices)
+                indexer_new, indexer_should_commit = (
+                    self.indexer.compressor.forward_decode(
+                        x,
+                        positions,
+                        indexer_kv_state,
+                        indexer_score_state,
+                    )
+                )
+                pool.indexer_kv_state[layer_index].index_copy_(
+                    0, request_indices, indexer_kv_state
+                )
+                pool.indexer_score_state[layer_index].index_copy_(
+                    0, request_indices, indexer_score_state
+                )
+                if indexer_should_commit.any():
+                    pool.write_indexer(
+                        layer_index,
+                        full_slots[indexer_should_commit],
+                        indexer_new[indexer_should_commit],
+                    )
+
+        offsets = torch.arange(win, device=x.device)
+        oldest_positions = (positions - win + 1).clamp(min=0)
+        window_positions = oldest_positions.unsqueeze(1) + offsets.unsqueeze(0)
+        window_valid = window_positions <= positions.unsqueeze(1)
+        topk_w = torch.where(
+            window_valid,
+            window_positions % win,
+            torch.full_like(window_positions, -1),
+        ).unsqueeze(1)
+        kv_unified = pool.swa_cache[layer_index].index_select(
+            0, request_indices
+        )
+
+        if m:
+            num_blocks = (positions + 1) // m
+            max_blocks = int(num_blocks.max().item())
+            block_positions = (
+                torch.arange(max_blocks, device=x.device) * m + (m - 1)
+            )
+            block_valid = (
+                block_positions.unsqueeze(0) <= positions.unsqueeze(1)
+            )
+            request_rows = request_indices.unsqueeze(1).expand(-1, max_blocks)
+            token_positions = block_positions.unsqueeze(0).expand(Bsz, -1)
+            block_full_slots = cache_manager.request_pool.req_to_token[
+                request_rows,
+                token_positions,
+            ]
+            block_valid = block_valid & (block_full_slots >= 0)
+            compressed_slots = block_full_slots.clamp(min=0) // m
+            kv_comp = pool.compressed_cache[layer_index][compressed_slots]
+            kv_comp = kv_comp.masked_fill(~block_valid.unsqueeze(-1), 0)
+            kv_unified = torch.cat([kv_unified, kv_comp], dim=1)
+
+            if self.mode == "csa":
+                indexer_keys = pool.indexer_cache[layer_index][
+                    compressed_slots
+                ]
+                indexer_keys = indexer_keys.masked_fill(
+                    ~block_valid.unsqueeze(-1), 0
+                )
+                selected, valid = self.indexer.select_decode(
+                    x,
+                    cQ,
+                    indexer_keys,
+                    positions,
+                    block_valid,
+                    m,
+                    self.config.index_topk,
+                )
+                topk_c = torch.where(
+                    valid,
+                    selected + win,
+                    torch.full_like(selected, -1),
+                )
+            else:
+                selected = torch.arange(
+                    max_blocks,
+                    device=x.device,
+                ).view(1, 1, -1).expand(Bsz, -1, -1)
+                causal = block_positions.unsqueeze(0) < positions.unsqueeze(1)
+                valid = block_valid & causal
+                topk_c = torch.where(
+                    valid.unsqueeze(1),
+                    selected + win,
+                    torch.full_like(selected, -1),
+                )
+            topk_idxs = torch.cat([topk_w, topk_c], dim=-1)
+        else:
+            topk_idxs = topk_w
+
+        o = sparse_attn(
+            q,
+            kv_unified,
+            self.attn_sink,
+            topk_idxs,
+            scale=1.0 / math.sqrt(c),
+        )
+        o = apply_partial_rope_decode(
+            o,
+            self._rope_cos,
+            -self._rope_sin,
+            self.rope_dim,
+            positions,
+        )
+        return self._output_proj(o)
+
 
 # =============================================================================
 # Clamped SwiGLU expert
@@ -1332,6 +1602,34 @@ class DeepseekV4Layer(nn.Module):
         ffn_out = self.ffn(sub_in, token_ids)
         X = MHC.hc_post(ffn_out, residual, post, comb)
         return X
+
+    def forward_decode(self, X: torch.Tensor, mhc: MHC,
+                       token_ids: torch.Tensor, positions: torch.Tensor,
+                       cache_manager, request_indices: torch.Tensor,
+                       full_slots: torch.Tensor) -> torch.Tensor:
+        """Run one layer for a batched one-token decode step."""
+        residual = X
+        pre, post, comb = mhc.gen_params(X, self.hc_attn_base, self.hc_attn_fn,
+                                         self.hc_attn_scale)
+        sub_in = MHC.hc_pre(X, pre)
+        sub_in = self.attn_norm(sub_in)
+        attn_out = self.attn.forward_decode(
+            sub_in,
+            positions,
+            self.layer_idx,
+            cache_manager,
+            request_indices,
+            full_slots,
+        )
+        X = MHC.hc_post(attn_out, residual, post, comb)
+
+        residual = X
+        pre, post, comb = mhc.gen_params(X, self.hc_ffn_base, self.hc_ffn_fn,
+                                         self.hc_ffn_scale)
+        sub_in = MHC.hc_pre(X, pre)
+        sub_in = self.ffn_norm(sub_in)
+        ffn_out = self.ffn(sub_in, token_ids)
+        return MHC.hc_post(ffn_out, residual, post, comb)
 
 
 # =============================================================================
@@ -1619,6 +1917,52 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
         h_out = self.norm(h_out)
         logits = self.head(h_out)
         return logits
+
+    def forward_decode(self, input_ids: torch.Tensor, cache_manager,
+                       request_indices: torch.Tensor) -> torch.Tensor:
+        """Decode ``input_ids [B, 1]`` for B independently cached requests."""
+        assert hasattr(self, "_inf_rope_cos"), "setup_caches() not called"
+        Bsz, S = input_ids.shape
+        assert S == 1, "batched decode expects input_ids shaped [B, 1]"
+        request_indices = torch.as_tensor(
+            request_indices,
+            dtype=torch.long,
+            device=input_ids.device,
+        ).reshape(-1)
+        assert request_indices.numel() == Bsz
+
+        positions = torch.tensor(
+            [
+                cache_manager.request_pool.request_lengths[index] - 1
+                for index in request_indices.tolist()
+            ],
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        if torch.any(positions < 0):
+            raise RuntimeError("allocate request tokens before model inference")
+        full_slots = cache_manager.request_pool.req_to_token[
+            request_indices,
+            positions,
+        ]
+
+        h = self.embed(input_ids)
+        n_hc = self.config.hc_mult
+        X = h.unsqueeze(-2).expand(-1, -1, n_hc, -1).contiguous()
+        for layer in self.layers:
+            X = layer.forward_decode(
+                X,
+                self._mhc,
+                input_ids,
+                positions,
+                cache_manager,
+                request_indices,
+                full_slots,
+            )
+        head_pre = self._mhc.gen_head_pre(X, self.hc_head_fn, self.hc_head_base,
+                                          self.hc_head_scale)
+        h_out = MHC.hc_pre(X, head_pre)
+        return self.head(self.norm(h_out))
 
     def _backbone(self, input_ids, attention_mask, position_ids):
         """Runs embed -> hc-expand -> N layers and returns BOTH the post-layer

@@ -15,7 +15,7 @@ class Request:
 
 
 class Scheduler:
-    """Prefill pending requests, then decode them in round-robin order."""
+    """Prefill requests separately, then decode active requests as one batch."""
 
     def __init__(self, model, max_requests, max_seq_len, page_size=96):
         self.model = model
@@ -74,6 +74,7 @@ class Scheduler:
 
             while active:
                 next_active = []
+                decode_tokens = []
                 for request in active:
                     next_token = request.logits[:, -1, :].argmax(dim=-1)
                     request.output_ids = torch.cat(
@@ -84,15 +85,27 @@ class Scheduler:
 
                     if request.generated_tokens < request.max_new_tokens:
                         self.cache_manager.allocate_tokens(request.request_index, 1)
-                        request.logits = self.model.forward_inference(
-                            next_token[:, None],
-                            self.cache_manager,
-                            request.request_index,
-                        )
                         next_active.append(request)
+                        decode_tokens.append(next_token[:, None])
                     else:
                         self.cache_manager.free_request(request.request_index)
                         request.logits = None
+
+                if next_active:
+                    # input_ids: [B, 1], request_indices: [B]
+                    input_ids = torch.cat(decode_tokens, dim=0)
+                    request_indices = torch.tensor(
+                        [request.request_index for request in next_active],
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                    logits = self.model.forward_decode(
+                        input_ids,
+                        self.cache_manager,
+                        request_indices,
+                    )
+                    for batch_index, request in enumerate(next_active):
+                        request.logits = logits[batch_index:batch_index + 1]
 
                 active = next_active
 
